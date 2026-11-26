@@ -1,0 +1,69 @@
+[package]
+name = "pretrain-scraper"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Bounded-memory Rust web crawler and cleaning pipeline that produces LLM pretraining corpora"
+license = "MIT"
+
+[[bin]]
+name = "pretrain-scraper"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+ego-tree = "0.6"
+encoding_rs = "0.8"
+futures = "0.3"
+indicatif = "0.17"
+once_cell = "1"
+psl = "2"
+rand = "0.8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "gzip",
+    "brotli",
+    "zstd",
+    "deflate",
+    "stream",
+    "cookies",
+] }
+scraper = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sled = "0.34"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "signal",
+    "fs",
+    "io-util",
+    "net",
+] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+unicode-normalization = "0.1"
+url = "2"
+whatlang = "0.16"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = "0.13"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

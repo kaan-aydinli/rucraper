@@ -1,0 +1,4 @@
+/target/
+/crawl_*/
+*.log
+*.tmp

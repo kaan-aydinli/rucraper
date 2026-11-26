@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "format": "txt",
+  "separator": "<veribitisi>",
+  "created_at": "2026-11-25T21:01:14Z",
+  "updated_at": "2026-11-25T21:01:37Z",
+  "shard_size_bytes": 8388608,
+  "documents": 12,
+  "words": 7055,
+  "bytes_uncompressed": 64242,
+  "shards": [
+    {
+      "name": "corpus_00000.txt",
+      "size_bytes": 64242,
+      "uncompressed_bytes": 64242,
+      "documents": 12,
+      "words": 7055,
+      "sha256": "ef30f0814f831d36fbe2dc7e2b34cc4d3511d6fdc91aaffeab88b0794afa957e"
+    }
+  ],
+  "rejects": {
+    "duplicate_lines": 1,
+    "low_punctuation": 4,
+    "too_few_words": 2,
+    "unsupported_language": 1
+  }
+}

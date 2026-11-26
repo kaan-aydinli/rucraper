@@ -1,0 +1,91 @@
+# 130 Türkçe site üzerinde, robots.txt'e saygılı, derin ve eşzamanlı tarama.
+[general]
+output_dir = "dataset_tr"
+db_path = "crawl_tr"
+log_level = "info"
+json_logs = false
+progress = false
+
+[frontier]
+# Site listesi bu dosyadan okunur: her satır bir site, aynı zamanda tarama
+# kapsamını (allowed_domains) belirler. `crawl --seeds` verilmezse seed'ler de
+# bu dosyadan alınır.
+allowed_domains = []
+allowed_domains_file = "sites_tr.txt"
+blocked_domains = []
+max_depth = 3
+min_delay_ms = 500
+max_concurrency_per_domain = 2
+ignore_robots = false
+respect_crawl_delay = true
+# 130 sitenin sitemap'lerini önceden indirmek ilk isteği dakikalarca geciktirir;
+# link keşfi zaten derinlikle yapılıyor.
+discover_sitemaps = false
+robots_ttl_secs = 86400
+queue_capacity = 20000
+max_pages = 2000
+seed_priority = 240
+
+[fetch]
+user_agent = "PretrainScraperBot/0.1 (+https://example.org/bot; research corpus builder)"
+accept_language = "tr-TR,tr;q=0.9,en;q=0.5"
+request_timeout_secs = 20
+max_response_bytes = 5242880
+max_retries = 0
+retry_base_delay_ms = 700
+max_redirects = 10
+
+[extract]
+min_block_chars = 120
+max_link_ratio = 0.45
+keep_tables = true
+keep_code_blocks = true
+max_links_per_page = 500
+max_title_chars = 300
+
+[filter]
+min_words = 50
+max_words = 1000000
+min_avg_word_len = 3.0
+max_avg_word_len = 12.0
+min_punctuation_line_ratio = 0.6
+min_alpha_word_ratio = 0.8
+max_symbol_word_ratio = 0.1
+max_duplicate_line_ratio = 0.25
+max_ngram_repetition_ratio = 0.3
+ngram_size = 5
+target_languages = ["tr"]
+min_lang_confidence = 0.6
+enable_language_filter = true
+enable_pii_masking = true
+
+[dedup]
+enable_exact = true
+enable_near_dup = true
+max_hamming_distance = 3
+shingle_size = 5
+paragraph_dedup_threshold = 3
+paragraph_dedup_max_entries = 65536
+
+[output]
+format = "txt"
+separator = "<veribitisi>"
+include_title = true
+max_chunk_words = 3000
+min_chunk_words = 25
+deduplicate = true
+dedup_min_sentence_words = 6
+dedup_index_capacity = 500000
+shard_size_bytes = 8388608
+manifest_name = "manifest.json"
+# Kaydedilen alt içerik sayfalarının tam URL'leri; sonraki taramalar bu
+# sayfaları istek atmadan atlar (anasayfa/kategori/listeleme URL'leri yazılmaz).
+saved_urls_file = "crawled_urls.txt"
+
+[pipeline]
+channel_capacity = 512
+fetch_workers = 32
+extract_workers = 0
+filter_workers = 0
+dedup_workers = 4
+dashboard_interval_ms = 500

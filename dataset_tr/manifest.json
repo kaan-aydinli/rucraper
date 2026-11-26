@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "created_at": "2026-11-25T20:43:25Z",
+  "updated_at": "2026-11-25T20:43:44Z",
+  "shard_size_bytes": 8388608,
+  "documents": 6,
+  "words": 21903,
+  "bytes_uncompressed": 180471,
+  "shards": [
+    {
+      "name": "shard_00000.jsonl.zst",
+      "size_bytes": 61669,
+      "uncompressed_bytes": 180471,
+      "documents": 6,
+      "words": 21903,
+      "sha256": "f9c3b460ec84b1c86469589cdd10cf9006f16deab983a1a19ab81b36b0c6f27b"
+    }
+  ],
+  "rejects": {
+    "duplicate_lines": 3,
+    "low_alpha_words": 1,
+    "low_punctuation": 5,
+    "too_few_words": 1,
+    "unsupported_language": 4
+  }
+}

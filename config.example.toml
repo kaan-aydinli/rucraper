@@ -1,0 +1,153 @@
+# =============================================================================
+# pretrain-scraper example configuration
+# Every value below is optional: the built-in defaults are identical to what is
+# written here, so deleting a key does not change behaviour.
+# Unknown keys are rejected so typos cannot silently disable a safety limit.
+# =============================================================================
+
+[general]
+# Directory receiving corpus_00000.txt shards and manifest.json.
+output_dir = "dataset"
+# Embedded LSM database (frontier queue, visited set, robots cache, dedup indices).
+db_path = "crawl_db"
+# tracing filter directive.
+log_level = "info"
+# Structured JSON logs instead of the human readable format.
+json_logs = false
+# Live indicatif dashboard on stderr.
+progress = true
+
+[frontier]
+# If non-empty, only these registrable domains (eTLD+1) are crawled.
+allowed_domains = []
+# Optional text file with one site per line (`https://example.com/` or a bare
+# domain, `#` comments). It is added to `allowed_domains` and, when `--seeds` is
+# not passed, supplies the seed URLs too. A relative path is resolved against
+# the config file's directory.
+allowed_domains_file = ""
+# Never crawled, even when linked from an allowed page.
+blocked_domains = []
+# Link depth counted from the seeds (0 = only the seeds themselves).
+max_depth = 3
+# Minimum spacing between two requests to the same domain, per worker slot.
+min_delay_ms = 1000
+# Concurrent in-flight requests allowed per domain.
+max_concurrency_per_domain = 2
+# Set to true only for corpora you own; robots.txt is honoured by default.
+ignore_robots = false
+# Obey robots.txt Crawl-delay when it is larger than min_delay_ms.
+respect_crawl_delay = true
+# Read sitemaps advertised in robots.txt before the crawl starts. Turn it off
+# for large site lists: sitemap discovery delays the first fetch considerably.
+discover_sitemaps = true
+# robots.txt cache lifetime in seconds.
+robots_ttl_secs = 86400
+# Pending URL budget (database side; channels add their own bounded backpressure).
+queue_capacity = 100000
+# Stop after this many fetched pages (0 = unlimited).
+max_pages = 0
+# Priority for seeds; higher numbers are dequeued first.
+seed_priority = 200
+
+[fetch]
+user_agent = "PretrainScraperBot/0.1 (+https://example.org/bot; research corpus builder)"
+accept_language = "en-US,en;q=0.9,tr;q=0.8"
+request_timeout_secs = 30
+# Streaming body cap: the transfer is aborted the moment this is exceeded.
+max_response_bytes = 5242880
+# Retries for 429/5xx/transport errors (403/404/410 are never retried).
+max_retries = 3
+retry_base_delay_ms = 500
+max_redirects = 10
+
+[extract]
+# A candidate block needs at least this much text to be considered article body.
+min_block_chars = 80
+# Blocks with a higher link-text ratio are link farms and are skipped.
+max_link_ratio = 0.45
+keep_tables = true
+keep_code_blocks = true
+max_links_per_page = 2000
+max_title_chars = 300
+
+[filter]
+# Short briefs are kept from 50 words; only pathological dumps are rejected
+# above one million words.
+min_words = 50
+max_words = 1000000
+min_avg_word_len = 3.0
+max_avg_word_len = 12.0
+min_punctuation_line_ratio = 0.6
+min_alpha_word_ratio = 0.8
+max_symbol_word_ratio = 0.1
+max_duplicate_line_ratio = 0.25
+max_ngram_repetition_ratio = 0.3
+ngram_size = 5
+target_languages = ["en", "tr"]
+min_lang_confidence = 0.85
+enable_language_filter = true
+enable_pii_masking = true
+blocked_phrases = [
+  "lorem ipsum",
+  "javascript is required",
+  "please enable cookies",
+  "enable javascript",
+  "404 not found",
+  "access denied",
+  "just a moment",
+  "cloudflare",
+  "subscribe to continue",
+  "sign in to continue",
+]
+
+[dedup]
+enable_exact = true
+enable_near_dup = true
+max_hamming_distance = 3
+shingle_size = 5
+# Paragraphs repeated more than this many times in one run are stripped.
+paragraph_dedup_threshold = 3
+# Bound of the in-memory paragraph counter; keeps RSS flat on huge crawls.
+paragraph_dedup_max_entries = 65536
+
+[output]
+# Shard layout: "txt" writes plain pretraining corpora, "jsonl" writes
+# compressed records with the full metadata schema.
+format = "txt"
+# Marker written on its own line after every document in txt mode.
+separator = "<veribitisi>"
+# Write the title in txt mode only when it shares content words with the body.
+include_title = true
+# Topic blocks: headings split topics, long sections are cut at sentence
+# boundaries, short blocks are merged with the next section.
+max_chunk_words = 3000
+min_chunk_words = 25
+# Remove paragraphs, sentences and blocks that already appeared earlier in the
+# corpus (repeated headlines, replayed lead paragraphs, republished text).
+deduplicate = true
+# Shortest sentence/paragraph checked for duplication.
+dedup_min_sentence_words = 6
+# Hard cap of the duplicate index; reaching it clears the index so memory stays
+# constant on TB-scale runs.
+dedup_index_capacity = 500000
+# Full URLs of saved content pages, appended inside output_dir. Later crawls
+# load this file and skip those pages before fetching (home pages, category and
+# listing pages are never written). Empty string disables the log.
+saved_urls_file = "crawled_urls.txt"
+# Shard size before rotation (default 256 MiB).
+shard_size_bytes = 268435456
+# Zstandard level (1-22) for the jsonl format; 3-6 is the recommended band.
+zstd_level = 5
+flush_interval_secs = 15
+manifest_name = "manifest.json"
+
+[pipeline]
+# Bounded channel capacity between every stage (natural backpressure).
+channel_capacity = 256
+fetch_workers = 32
+# 0 = number of CPUs.
+extract_workers = 0
+filter_workers = 0
+# 0 = half the CPUs.
+dedup_workers = 0
+dashboard_interval_ms = 500
