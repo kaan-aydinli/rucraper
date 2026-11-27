@@ -22,7 +22,7 @@ jobs:
     name: format, clippy, docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -43,7 +43,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -54,7 +54,7 @@ jobs:
     name: minimum supported Rust (1.88)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
