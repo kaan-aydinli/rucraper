@@ -155,10 +155,7 @@ mod tests {
     #[test]
     fn duplicated_lines_are_rejected() {
         let line = "Buy the best product at the lowest price available today.";
-        let text = std::iter::repeat(line)
-            .take(30)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = std::iter::repeat_n(line, 30).collect::<Vec<_>>().join("\n");
         let stats = analyze(&text, 5);
         assert!(stats.duplicate_line_ratio > 0.9);
         assert_eq!(

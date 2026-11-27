@@ -8,7 +8,10 @@
 //! * `jsonl` — Zstandard-compressed records `shard_XXXXX.jsonl.zst` with the
 //!   full metadata schema.
 //!
-//! A shard is finished, fsynced, hashed with SHA-256 and then recorded. The
+//! Pending bytes are flushed on record batches, when `output.flush_interval_secs`
+//! elapses during writing, and by [`ShardWriter::flush_pending`] when the
+//! pipeline goes idle, so a crash cannot lose more than that window. A shard is
+//! finished, fsynced, hashed with SHA-256 and then recorded. The
 //! manifest is always written to `<name>.tmp` and renamed over the real file, so
 //! a crash can never leave a half-written manifest: readers either see the
 //! previous version or the complete new one.
@@ -18,6 +21,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -30,6 +34,9 @@ use crate::telemetry::Stats;
 
 /// Current manifest schema version.
 pub const MANIFEST_VERSION: u32 = 2;
+
+/// Records buffered before a shard is flushed to the operating system.
+const FLUSH_BATCH_RECORDS: u64 = 256;
 
 /// One finished shard.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +164,8 @@ pub struct ShardWriter {
     base_rejects: BTreeMap<String, u64>,
     active: Option<ActiveShard>,
     next_index: u32,
+    flush_interval: Duration,
+    last_flush: Instant,
 }
 
 impl ShardWriter {
@@ -204,6 +213,8 @@ impl ShardWriter {
             base_rejects,
             active: None,
             next_index,
+            flush_interval: Duration::from_secs(config.flush_interval_secs.max(1)),
+            last_flush: Instant::now(),
         })
     }
 
@@ -275,30 +286,71 @@ impl ShardWriter {
         if self.active.is_none() {
             self.open_next()?;
         }
-        let active = self
-            .active
-            .as_mut()
-            .ok_or_else(|| ScraperError::storage("no active shard"))?;
+        let rotate = {
+            let active = self
+                .active
+                .as_mut()
+                .ok_or_else(|| ScraperError::storage("no active shard"))?;
+            let writer = active
+                .writer
+                .as_mut()
+                .ok_or_else(|| ScraperError::storage("active shard has no writer"))?;
+            writer
+                .write_all(bytes)
+                .map_err(|e| ScraperError::io_at(&active.path, e))?;
+            active.uncompressed += bytes.len() as u64;
+            active.documents += 1;
+            active.words += words;
+            active.since_flush += 1;
+            active.uncompressed >= self.shard_size_bytes
+        };
+        // Flush on whichever comes first: a batch of records or the configured
+        // interval. Idle periods never reach this point, so the writer stage
+        // calls `flush_pending` for those.
+        if self.pending_records() >= FLUSH_BATCH_RECORDS
+            || self.last_flush.elapsed() >= self.flush_interval
+        {
+            self.flush_pending()?;
+        }
+        if rotate {
+            self.rotate()?;
+        }
+        Ok(())
+    }
+
+    /// Records written into the open shard since the last flush.
+    fn pending_records(&self) -> u64 {
+        self.active
+            .as_ref()
+            .map(|active| active.since_flush)
+            .unwrap_or(0)
+    }
+
+    /// Write the buffered bytes to the operating system without finishing the
+    /// shard or touching the manifest.
+    ///
+    /// `write` only runs while records arrive, so an idle pipeline (a slow host,
+    /// a long politeness delay, the tail of a run) would otherwise keep its
+    /// buffer in memory until the next document or the final `rotate`. The
+    /// writer stage calls this whenever no document arrived for
+    /// `output.flush_interval_secs`, which keeps that setting true even when the
+    /// crawl is completely quiet.
+    pub fn flush_pending(&mut self) -> Result<()> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(());
+        };
+        if active.since_flush == 0 {
+            return Ok(());
+        }
         let writer = active
             .writer
             .as_mut()
             .ok_or_else(|| ScraperError::storage("active shard has no writer"))?;
         writer
-            .write_all(bytes)
+            .flush()
             .map_err(|e| ScraperError::io_at(&active.path, e))?;
-        active.uncompressed += bytes.len() as u64;
-        active.documents += 1;
-        active.words += words;
-        active.since_flush += 1;
-        if active.since_flush >= 256 {
-            writer
-                .flush()
-                .map_err(|e| ScraperError::io_at(&active.path, e))?;
-            active.since_flush = 0;
-        }
-        if active.uncompressed >= self.shard_size_bytes {
-            self.rotate()?;
-        }
+        active.since_flush = 0;
+        self.last_flush = Instant::now();
         Ok(())
     }
 
@@ -693,6 +745,45 @@ mod tests {
             .unwrap();
         assert_eq!(second.documents, first.documents + 10);
         assert!(verify_dataset(dir.path(), "manifest.json").unwrap().is_ok());
+    }
+
+    #[test]
+    fn flush_pending_persists_the_buffer_without_closing_the_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let stats = Arc::new(Stats::new());
+        let mut writer = ShardWriter::new(dir.path(), &txt_config(), stats).unwrap();
+        writer.write(&document(0)).unwrap();
+
+        let shard = list_shards(dir.path())
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("shard file exists while it is written");
+        assert_eq!(
+            std::fs::metadata(&shard).unwrap().len(),
+            0,
+            "the record must still sit in the buffer before the flush"
+        );
+
+        writer.flush_pending().unwrap();
+        assert!(
+            std::fs::metadata(&shard).unwrap().len() > 0,
+            "flush_pending must write the buffered record to disk"
+        );
+        assert!(
+            crate::storage::load_manifest(dir.path(), "manifest.json")
+                .unwrap()
+                .is_none(),
+            "flush_pending must not finish the shard"
+        );
+
+        // The shard stays usable: another record can be appended and the
+        // dataset remains verifiable.
+        writer.write(&document(1)).unwrap();
+        writer.finalize().unwrap();
+        let report = verify_dataset(dir.path(), "manifest.json").unwrap();
+        assert!(report.is_ok(), "failures: {:?}", report.failures);
+        assert_eq!(report.documents, 2);
     }
 
     #[test]

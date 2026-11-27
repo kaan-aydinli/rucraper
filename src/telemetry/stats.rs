@@ -25,12 +25,12 @@ pub struct Progress {
 impl Progress {
     /// Number of URLs handed to the pipeline.
     pub fn dispatched(&self) -> u64 {
-        self.dispatched.fetch_add(0, Ordering::Relaxed)
+        self.dispatched.load(Ordering::Relaxed)
     }
 
     /// Number of URLs fully drained by the pipeline.
     pub fn completed(&self) -> u64 {
-        self.completed.fetch_add(0, Ordering::Relaxed)
+        self.completed.load(Ordering::Relaxed)
     }
 
     /// Register one new in-flight unit of work.
@@ -344,15 +344,7 @@ impl Dashboard {
                 "filter" => format!(
                     "filter     accepted={} rejected={}",
                     snap.accepted_docs,
-                    stats
-                        .rejected
-                        .iter()
-                        .map(|c| c.load(Ordering::Relaxed))
-                        .sum::<u64>()
-                        .saturating_sub(
-                            stats.reject_count(RejectReason::ExactDuplicate)
-                                + stats.reject_count(RejectReason::NearDuplicate)
-                        )
+                    short_rejects(stats, FILTER_REJECTS)
                 ),
                 _ => format!(
                     "dedup      exact_dup={} near_dup={} shards={}",
@@ -374,6 +366,23 @@ impl Dashboard {
         let _ = &self.multi;
     }
 }
+
+/// Rejections produced by the quality filter itself (fetch, robots and dedup
+/// have their own counters and must not be mixed into the filter line).
+const FILTER_REJECTS: &[RejectReason] = &[
+    RejectReason::TooFewWords,
+    RejectReason::TooManyWords,
+    RejectReason::AvgWordLength,
+    RejectReason::LowPunctuation,
+    RejectReason::LowAlphaWords,
+    RejectReason::HighSymbolRatio,
+    RejectReason::BlockedPhrase,
+    RejectReason::DuplicateLines,
+    RejectReason::RepetitiveNgrams,
+    RejectReason::LanguageUndetermined,
+    RejectReason::LowLanguageConfidence,
+    RejectReason::UnsupportedLanguage,
+];
 
 fn short_rejects(stats: &Stats, reasons: &[RejectReason]) -> u64 {
     reasons.iter().map(|r| stats.reject_count(*r)).sum()

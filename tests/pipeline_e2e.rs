@@ -142,6 +142,144 @@ fn article_page(title: &str, slug: &str, text: &str) -> String {
     )
 }
 
+/// Serve `/` immediately and `/slow` only after `delay`, so the pipeline holds
+/// a buffered record and then sits completely idle while the crawl is running.
+async fn spawn_slow_site(delay: Duration) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                if read == 0 {
+                    return;
+                }
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let (status, body) = match path.as_str() {
+                    "/robots.txt" => ("200 OK", "User-agent: *\nAllow: /\n".to_string()),
+                    "/" => (
+                        "200 OK",
+                        article_page("Rust for systems work", "rust", RUST_TEXT).replace(
+                            "</article>",
+                            "<p><a href=\"/slow\">Slow page</a></p></article>",
+                        ),
+                    ),
+                    "/slow" => {
+                        tokio::time::sleep(delay).await;
+                        (
+                            "200 OK",
+                            article_page("Life in the ocean", "ocean", OCEAN_TEXT),
+                        )
+                    }
+                    _ => ("404 Not Found", "not found".to_string()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (address, handle)
+}
+
+/// Serve `robots.txt` asking for one request per hour, plus a single page.
+async fn spawn_crawl_delay_site() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                if read == 0 {
+                    return;
+                }
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let (content_type, body) = match path.as_str() {
+                    "/robots.txt" => (
+                        "text/plain",
+                        "User-agent: *\nAllow: /\nCrawl-delay: 3600\n".to_string(),
+                    ),
+                    _ => (
+                        "text/html; charset=utf-8",
+                        article_page("Rust for systems work", "rust", RUST_TEXT),
+                    ),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (address, handle)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn excessive_crawl_delay_is_skipped_instead_of_stalling_the_run() {
+    let (address, server) = spawn_crawl_delay_site().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = test_config(dir.path());
+    config.frontier.max_crawl_delay_ms = 500;
+    let seed = format!("http://{address}/");
+
+    let started = std::time::Instant::now();
+    let summary = tokio::time::timeout(
+        Duration::from_secs(20),
+        pipeline::run(config, RunMode::Crawl { seeds: vec![seed] }),
+    )
+    .await
+    .expect("the crawl must not wait out an hour long crawl-delay")
+    .expect("crawl succeeds");
+    server.abort();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "host must be skipped quickly, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        summary.snapshot.fetched, 0,
+        "the only URL belongs to a host above the crawl-delay ceiling"
+    );
+    assert!(
+        summary.snapshot.robots_blocked >= 1,
+        "the skipped host must be reported as robots-blocked"
+    );
+}
+
+/// Total size of the `corpus_*.txt` shards written so far.
+fn corpus_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with("corpus_") && name.ends_with(".txt") {
+            total += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        }
+    }
+    total
+}
+
 fn index_page() -> String {
     String::from(
         r#"<!DOCTYPE html>
@@ -451,6 +589,43 @@ async fn saved_content_pages_are_skipped_on_a_fresh_crawl() {
         "skipped page leaked into the corpus: {corpus}"
     );
     assert!(corpus.contains("Rust is a systems programming language"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_pipeline_flushes_the_shard_within_the_configured_interval() {
+    // The linked page answers only after 30s, so the crawl is still running long
+    // after the deadline below. Any shard bytes on disk before that deadline can
+    // therefore only come from the idle flush, never from shutdown.
+    let (address, server) = spawn_slow_site(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = test_config(dir.path());
+    config.output.flush_interval_secs = 1;
+    let output_dir = config.general.output_dir.clone();
+    let seed = format!("http://{address}/");
+
+    let crawl = tokio::spawn(pipeline::run(config, RunMode::Crawl { seeds: vec![seed] }));
+
+    let mut written = 0u64;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        written = corpus_bytes(&output_dir);
+        if written > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        written > 0,
+        "buffered shard bytes never reached disk while the pipeline was idle"
+    );
+    assert!(
+        !crawl.is_finished(),
+        "the crawl must still be running when the idle flush happens"
+    );
+
+    crawl.abort();
+    let _ = crawl.await;
+    server.abort();
 }
 
 /// Persist a config file so the rerun resumes the same database and dataset.

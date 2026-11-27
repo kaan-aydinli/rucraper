@@ -55,7 +55,7 @@ pub fn luhn_valid(digits: &str) -> bool {
         sum += value;
         double = !double;
     }
-    count >= 13 && sum % 10 == 0
+    count >= 13 && sum.is_multiple_of(10)
 }
 
 fn digits_only(input: &str) -> String {

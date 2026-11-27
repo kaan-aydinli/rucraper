@@ -16,6 +16,7 @@
 //! dispatched URL has finished, which is what makes the run terminate cleanly
 //! without any polling of individual stages.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,48 @@ use crate::telemetry::{CompletionGuard, Dashboard, Progress, Stats, StatsSnapsho
 static SITEMAP_LOC: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?is)<loc>\s*([^<\s]+)\s*</loc>").expect("static regex: sitemap loc")
 });
+
+/// URLs pulled from the frontier per blocking round trip.
+const POP_BATCH_SIZE: usize = 64;
+
+/// How many popped batches the feeder may hold while every domain it knows is
+/// saturated, i.e. the maximum number of URLs buffered outside the frontier.
+const BACKLOG_BATCHES: usize = 16;
+
+/// Dispatched-but-unfinished fetches per domain.
+///
+/// The frontier pops URLs in priority order, which usually groups a domain's
+/// URLs together. Without this bookkeeping a single domain could occupy every
+/// fetch slot and then block on its own per-domain limit, leaving the other
+/// domains unserved and the network idle.
+type DomainInflight = Arc<Mutex<HashMap<String, usize>>>;
+
+/// Current number of unfinished fetches for `domain` (0 when unknown).
+fn domain_inflight(inflight: &DomainInflight, domain: &str) -> usize {
+    inflight
+        .lock()
+        .map(|map| map.get(domain).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Add (positive) or remove (negative) one in-flight fetch for `domain`.
+fn adjust_domain_inflight(inflight: &DomainInflight, domain: &str, delta: i8) {
+    let Ok(mut map) = inflight.lock() else {
+        return;
+    };
+    let empty = {
+        let counter = map.entry(domain.to_string()).or_insert(0);
+        if delta >= 0 {
+            *counter += delta as usize;
+        } else {
+            *counter = counter.saturating_sub(delta.unsigned_abs() as usize);
+        }
+        *counter == 0
+    };
+    if empty {
+        map.remove(domain);
+    }
+}
 
 /// What the pipeline should feed the cleaning stages with.
 #[derive(Debug, Clone)]
@@ -83,6 +126,7 @@ struct StageContext {
     store: Arc<Store>,
     stats: Arc<Stats>,
     crawl: bool,
+    inflight: DomainInflight,
 }
 
 struct FetchJob {
@@ -167,9 +211,10 @@ pub async fn run(config: Config, mode: RunMode) -> Result<RunSummary> {
         store: store.clone(),
         stats: stats.clone(),
         crawl,
+        inflight: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let fetcher = Fetcher::new(&config.fetch)?;
+    let fetcher = Fetcher::new(&config.fetch, config.frontier.max_concurrency_per_domain)?;
     let robots = Arc::new(RobotsCache::new(
         fetcher.client(),
         &config.fetch.user_agent,
@@ -363,10 +408,16 @@ async fn feed_crawl(
     saved_urls: Option<Arc<Mutex<SavedUrls>>>,
 ) -> Result<()> {
     let max_pages = ctx.config.frontier.max_pages;
+    let domain_cap = ctx.config.frontier.max_concurrency_per_domain.max(1);
     let mut dispatched: u64 = 0;
     let mut since_stats: u64 = 0;
+    // URLs are popped in batches by a single blocking call and then dispatched
+    // one by one. Popping through `spawn_blocking` for every single URL put a
+    // task switch and a database round trip in front of every fetch, which is
+    // exactly where a fast network stage used to lose its parallelism.
+    let mut backlog: VecDeque<UrlEntry> = VecDeque::with_capacity(POP_BATCH_SIZE);
 
-    loop {
+    'feed: loop {
         if shutdown.load(Ordering::Relaxed) {
             tracing::info!("shutdown requested, stopping frontier feed");
             break;
@@ -375,45 +426,103 @@ async fn feed_crawl(
             tracing::info!(max_pages, "page budget reached");
             break;
         }
-        let store = ctx.store.clone();
-        let next = tokio::task::spawn_blocking(move || store.pop_next()).await??;
-        match next {
-            Some(entry) => {
-                // A fresh database would fetch every URL again; the saved-page
-                // file makes an already-written content page a pre-fetch skip.
-                let already_saved = saved_urls.as_ref().is_some_and(|saved| {
-                    saved
-                        .lock()
-                        .map(|saved| saved.contains(&entry.url))
-                        .unwrap_or(false)
-                });
-                if already_saved {
-                    tracing::trace!(url = %entry.url, "content page already saved; skipping");
-                    continue;
-                }
-                dispatched += 1;
-                since_stats += 1;
-                progress.dispatch();
-                if since_stats >= 32 {
-                    since_stats = 0;
-                    ctx.stats.set_queue_depth(ctx.store.pending_count());
-                    ctx.stats.set_visited(ctx.store.visited_count());
-                }
-                let job = FetchJob {
-                    entry,
-                    _guard: CompletionGuard::new(progress.clone()),
-                };
-                if jobs_tx.send(job).await.is_err() {
-                    break;
-                }
-            }
-            None => {
+        if backlog.is_empty() {
+            let store = ctx.store.clone();
+            let batch =
+                tokio::task::spawn_blocking(move || store.pop_batch(POP_BATCH_SIZE)).await??;
+            if batch.is_empty() {
                 if progress.dispatched() == progress.completed() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            backlog.extend(batch);
+        }
+
+        // Rotate through the backlog instead of draining it in order: a URL
+        // whose domain already has `domain_cap` requests in flight goes to the
+        // back of the queue so that other domains can use the fetch slots in
+        // the meantime. Without this, a domain whose URLs happen to be adjacent
+        // in the frontier can occupy every worker and still be throttled by its
+        // own per-domain limit.
+        let mut scanned = backlog.len();
+        let mut dispatched_any = false;
+        while scanned > 0 {
+            scanned -= 1;
+            let Some(entry) = backlog.pop_front() else {
+                break;
+            };
+            if shutdown.load(Ordering::Relaxed) || (max_pages > 0 && dispatched >= max_pages) {
+                backlog.push_front(entry);
+                break 'feed;
+            }
+            // A fresh database would fetch every URL again; the saved-page
+            // file makes an already-written content page a pre-fetch skip.
+            if is_saved(&saved_urls, &entry.url) {
+                tracing::trace!(url = %entry.url, "content page already saved; skipping");
+                continue;
+            }
+            if domain_inflight(&ctx.inflight, &entry.domain) >= domain_cap {
+                backlog.push_back(entry);
+                continue;
+            }
+            dispatched += 1;
+            since_stats += 1;
+            progress.dispatch();
+            adjust_domain_inflight(&ctx.inflight, &entry.domain, 1);
+            if since_stats >= 32 {
+                since_stats = 0;
+                ctx.stats.set_queue_depth(ctx.store.pending_count());
+                ctx.stats.set_visited(ctx.store.visited_count());
+            }
+            let domain = entry.domain.clone();
+            let job = FetchJob {
+                entry,
+                _guard: CompletionGuard::new(progress.clone()),
+            };
+            if jobs_tx.send(job).await.is_err() {
+                // The fetch stage is gone, so no completion will release the
+                // slot; drop the reservation before leaving.
+                adjust_domain_inflight(&ctx.inflight, &domain, -1);
+                break 'feed;
+            }
+            dispatched_any = true;
+        }
+
+        if !dispatched_any {
+            // Every remaining URL belongs to a saturated domain. Pull another
+            // batch first: the frontier is grouped by domain, so the next URLs
+            // are what lets the idle fetch slots work on other domains. The
+            // backlog is bounded: once it holds plenty of diverse URLs there is
+            // nothing to gain from buffering the whole frontier in memory
+            // (anything still buffered is requeued on exit anyway).
+            if backlog.len() >= POP_BATCH_SIZE * BACKLOG_BATCHES {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                continue;
+            }
+            let store = ctx.store.clone();
+            let more =
+                tokio::task::spawn_blocking(move || store.pop_batch(POP_BATCH_SIZE)).await??;
+            if more.is_empty() {
+                // Nothing else to dispatch right now: wait for a fetch to
+                // finish instead of spinning.
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            } else {
+                backlog.extend(more);
             }
         }
+    }
+
+    // Whatever was popped but never dispatched goes back to the frontier, so
+    // an interrupted run resumes instead of dropping work.
+    if !backlog.is_empty() {
+        let leftover: Vec<UrlEntry> = backlog.into_iter().collect();
+        tracing::info!(
+            leftover = leftover.len(),
+            "returning undispatched urls to the frontier"
+        );
+        ctx.store.requeue(&leftover)?;
     }
 
     drop(jobs_tx);
@@ -501,7 +610,9 @@ async fn feed_jsonl(
 ) -> Result<()> {
     use std::io::BufRead;
 
-    let reader: Box<dyn BufRead> = if path
+    // `+ Send` keeps the whole `run` future `Send`, so callers can spawn the
+    // pipeline on a multi-threaded runtime instead of only awaiting it inline.
+    let reader: Box<dyn BufRead + Send> = if path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("zst"))
@@ -808,6 +919,9 @@ where
             }
             drop(permit);
         });
+        // Reap finished tasks, otherwise the join set keeps one entry per
+        // processed document for the whole run and memory grows with the crawl.
+        while tasks.try_join_next().is_some() {}
     }
     while tasks.join_next().await.is_some() {}
     Ok(())
@@ -840,6 +954,9 @@ async fn fetch_stage(
         let robots = robots.clone();
         tasks.spawn(async move {
             let outcome = fetch_one(&ctx, &fetcher, &scheduler, &robots, &job.entry).await;
+            // Release the domain's dispatch slot as soon as the request is
+            // done; downstream extraction/dedup work must not keep it busy.
+            adjust_domain_inflight(&ctx.inflight, &job.entry.domain, -1);
             match outcome {
                 FetchOutcome::Page(page) => {
                     tracing::debug!(
@@ -865,6 +982,7 @@ async fn fetch_stage(
             }
             drop(permit);
         });
+        while tasks.try_join_next().is_some() {}
     }
     while tasks.join_next().await.is_some() {}
     Ok(())
@@ -895,7 +1013,23 @@ async fn fetch_one(
             return FetchOutcome::Skipped(RejectReason::RobotsBlocked);
         }
         if ctx.config.frontier.respect_crawl_delay {
-            crawl_delay = rules.crawl_delay();
+            if let Some(delay) = rules.crawl_delay() {
+                let ceiling = Duration::from_millis(ctx.config.frontier.max_crawl_delay_ms);
+                if delay > ceiling {
+                    // Waiting out a very long delay occupies the fetch slot for
+                    // that host, and the run cannot finish until every
+                    // dispatched URL is done, so such hosts are skipped.
+                    tracing::debug!(
+                        domain = %entry.domain,
+                        delay_ms = delay.as_millis() as u64,
+                        max_crawl_delay_ms = ctx.config.frontier.max_crawl_delay_ms,
+                        "crawl-delay above the configured maximum; skipping host"
+                    );
+                    ctx.stats.record_robots_blocked();
+                    return FetchOutcome::Skipped(RejectReason::RobotsBlocked);
+                }
+                crawl_delay = Some(delay);
+            }
         }
     }
 
@@ -1064,8 +1198,30 @@ async fn writer_stage(
     saved_urls: Option<Arc<Mutex<SavedUrls>>>,
 ) -> Result<()> {
     let mut writer = ShardWriter::new(&config.general.output_dir, &config.output, stats)?;
+    // Arriving records flush by batch and by interval inside `ShardWriter`, but
+    // a quiet crawl (a slow host, a politeness delay, the tail of a run) sends
+    // nothing at all. This stage therefore owns the idle timer: when no
+    // document arrives for `output.flush_interval_secs`, the pending buffer is
+    // persisted instead of waiting for the next record or for shutdown.
+    let idle_flush = Duration::from_secs(config.output.flush_interval_secs.max(1));
     let mut fatal: Option<ScraperError> = None;
-    while let Some(item) = rx.recv().await {
+    loop {
+        let next = match tokio::time::timeout(idle_flush, rx.recv()).await {
+            Ok(next) => next,
+            Err(_elapsed) => {
+                if fatal.is_none() {
+                    if let Err(error) = writer.flush_pending() {
+                        tracing::error!(%error, "idle shard flush failed; stopping the crawl");
+                        fatal = Some(error);
+                        shutdown.store(true, Ordering::Relaxed);
+                    }
+                }
+                continue;
+            }
+        };
+        let Some(item) = next else {
+            break;
+        };
         if fatal.is_some() {
             continue;
         }

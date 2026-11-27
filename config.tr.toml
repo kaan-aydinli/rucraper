@@ -1,4 +1,4 @@
-# 130 Türkçe site üzerinde, robots.txt'e saygılı, derin ve eşzamanlı tarama.
+# 1000+ Türkçe site üzerinde, robots.txt'e saygılı, eşzamanlı tarama.
 [general]
 output_dir = "dataset_tr"
 db_path = "crawl_tr"
@@ -13,17 +13,24 @@ progress = false
 allowed_domains = []
 allowed_domains_file = "sites_tr.txt"
 blocked_domains = []
-max_depth = 3
+max_depth = 4
 min_delay_ms = 500
 max_concurrency_per_domain = 2
 ignore_robots = false
 respect_crawl_delay = true
-# 130 sitenin sitemap'lerini önceden indirmek ilk isteği dakikalarca geciktirir;
-# link keşfi zaten derinlikle yapılıyor.
+# 5 sn'den uzun Crawl-delay isteyen siteler bu koşuda atlanır (robots_blocked);
+# bu siteler bir isteği dakikalarca bekletip fetch slotlarını tıkadığı için
+# bütçe bitse bile koşu sürüyordu. Daha nazik olmak için yükseltebilirsiniz.
+max_crawl_delay_ms = 5000
+# Binlerce sitenin sitemap'lerini önceden indirmek ilk isteği dakikalarca
+# geciktirir; link keşfi zaten derinlikle yapılıyor.
 discover_sitemaps = false
 robots_ttl_secs = 86400
 queue_capacity = 20000
-max_pages = 2000
+# Sayfa bütçesi tüm site listesi için ortaktır: 1084 site ile bu değer site
+# başına ~4-5 sayfa demektir (derinlik 4'te anasayfa + kategori + birkaç
+# içerik sayfası). Site sayısı değişirse bütçeyi de ölçekleyin.
+max_pages = 5000
 seed_priority = 240
 
 [fetch]
@@ -84,7 +91,11 @@ saved_urls_file = "crawled_urls.txt"
 
 [pipeline]
 channel_capacity = 512
-fetch_workers = 32
+# ~1000 bağımsız site var; istekler domain başına 2 eşzamanlılık ve 500 ms
+# aralıkla sınırlandığı için yüksek sayıda uçuştaki istek ağ gecikmesini gizler.
+# Ölçümlerde 128 işçi tepe noktasıydı (256 ek kazanç vermedi, belleği ikiye
+# katlıyor). Bellek üst sınırı ~ fetch_workers x fetch.max_response_bytes.
+fetch_workers = 128
 extract_workers = 0
 filter_workers = 0
 dedup_workers = 4

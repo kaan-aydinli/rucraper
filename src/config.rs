@@ -84,6 +84,13 @@ pub struct FrontierConfig {
     pub ignore_robots: bool,
     /// Honour `Crawl-delay` from `robots.txt` when it exceeds `min_delay_ms`.
     pub respect_crawl_delay: bool,
+    /// Largest `Crawl-delay` this crawler is willing to wait out.
+    ///
+    /// Hosts that ask for a longer pause are skipped for the run and counted as
+    /// robots-blocked. Without a ceiling a single host advertising, say, a five
+    /// minute delay keeps its fetch slots (and therefore the whole run) busy
+    /// long after the page budget is spent.
+    pub max_crawl_delay_ms: u64,
     /// Read sitemaps advertised in `robots.txt` before crawling. Disable it for
     /// large site lists: discovering every sitemap delays the first fetch a lot,
     /// while depth-based link discovery already covers the same sites.
@@ -107,11 +114,12 @@ impl Default for FrontierConfig {
             allowed_domains: Vec::new(),
             allowed_domains_file: PathBuf::new(),
             blocked_domains: Vec::new(),
-            max_depth: 3,
+            max_depth: 4,
             min_delay_ms: 1_000,
             max_concurrency_per_domain: 2,
             ignore_robots: false,
             respect_crawl_delay: true,
+            max_crawl_delay_ms: 5_000,
             discover_sitemaps: true,
             robots_ttl_secs: 86_400,
             queue_capacity: 100_000,
@@ -387,7 +395,10 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             channel_capacity: 256,
-            fetch_workers: 32,
+            // In-flight HTTP requests. The crawl is network bound, so this is
+            // deliberately well above the CPU count; kept at 64 so the worst
+            // case memory (workers x max_response_bytes) stays modest.
+            fetch_workers: 64,
             extract_workers: 0,
             filter_workers: 0,
             dedup_workers: 0,
@@ -531,6 +542,11 @@ impl Config {
         if self.general.output_dir.as_os_str().is_empty() {
             return Err(ScraperError::config("general.output_dir must not be empty"));
         }
+        if self.frontier.max_crawl_delay_ms > 3_600_000 {
+            return Err(ScraperError::config(
+                "frontier.max_crawl_delay_ms must not exceed 3600000 (one hour)",
+            ));
+        }
         if self.frontier.max_concurrency_per_domain == 0 {
             return Err(ScraperError::config(
                 "frontier.max_concurrency_per_domain must be >= 1",
@@ -663,6 +679,11 @@ impl Config {
         if self.output.shard_size_bytes < 1024 {
             return Err(ScraperError::config(
                 "output.shard_size_bytes must be at least 1024",
+            ));
+        }
+        if self.output.flush_interval_secs == 0 {
+            return Err(ScraperError::config(
+                "output.flush_interval_secs must be >= 1",
             ));
         }
         if matches!(self.output.format, OutputFormat::Jsonl)
@@ -803,6 +824,30 @@ mod tests {
         assert!(config.filter.max_words >= 1_000_000);
         assert_eq!(config.output.min_chunk_words, 25);
         assert_eq!(config.output.max_chunk_words, 3_000);
+    }
+
+    #[test]
+    fn turkish_site_list_provides_more_than_a_thousand_sites() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.tr.toml");
+        let config = Config::load(&path).expect("turkish config parses");
+        assert!(
+            config.frontier.site_seeds.len() > 1_000,
+            "expected more than 1000 seed sites, got {}",
+            config.frontier.site_seeds.len()
+        );
+        assert!(
+            config.frontier.allowed_domains.len() > 1_000,
+            "expected more than 1000 allowed domains, got {}",
+            config.frontier.allowed_domains.len()
+        );
+        assert!(
+            config
+                .frontier
+                .site_seeds
+                .iter()
+                .all(|seed| seed.starts_with("http")),
+            "every seed must be an absolute http(s) URL"
+        );
     }
 
     #[test]

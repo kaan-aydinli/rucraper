@@ -1,5 +1,7 @@
 # pretrain-scraper
 
+[![CI](https://github.com/kaan-aydinli/rucraper/actions/workflows/ci.yml/badge.svg)](https://github.com/kaan-aydinli/rucraper/actions/workflows/ci.yml)
+
 Sıfırdan Rust ile yazılmış, **sabit bellekli**, **kesintiye dayanıklı** bir web crawler ve veri temizleme motoru. Çıktı, doğrudan LLM pretraining eğitimine verilebilecek şekilde tekilleştirilmiş, filtrelenmiş, PII maskelenmiş `JSONL + Zstandard` shard'ları ve bunların SHA-256 manifestidir.
 
 Harici Python/JS betiği, servis veya veritabanı sunucusu gerekmez: tek bir statik binary, gömülü LSM-tree veritabanı ve disk üzerindeki shard'lar yeterlidir.
@@ -40,7 +42,7 @@ Harici Python/JS betiği, servis veya veritabanı sunucusu gerekmez: tek bir sta
 ## 2. Kurulum
 
 ```bash
-# Rust 1.80+ (stable)
+# Rust 1.88+ (stable, bkz. rust-version)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 git clone <repo> && cd pretrain-scraper
@@ -73,7 +75,7 @@ pretrain-scraper crawl --config config.toml --max-pages 5000
 pretrain-scraper crawl --config config.toml --seeds seeds.txt
 ```
 
-Depoda hazır gelen `sites_tr.txt`, robots.txt'i izin veren **130 Türkçe site** içerir (26 Kasım 2026 tarihinde kontrol edildi). `config.tr.toml` bu dosyayı `frontier.allowed_domains_file` ile okur: dosya hem tarama kapsamını hem de seed listesini verir, ayrıca `--seeds` gerekmez.
+Depoda hazır gelen `sites_tr.txt`, robots.txt'i izin veren **1.084 Türkçe site** içerir (27 Kasım 2026'da robots.txt ve anasayfa erişimi ile doğrulandı; kaynak: elle seçilmiş siteler + Tranco top-1m listesindeki `.tr` alan adları). `config.tr.toml` bu dosyayı `frontier.allowed_domains_file` ile okur: dosya hem tarama kapsamını hem de seed listesini verir, ayrıca `--seeds` gerekmez.
 
 `frontier.discover_sitemaps = false` (Türkçe yapılandırmada varsayılan) ilk isteği geciktirmemek için robots.txt sitemap keşfini kapatır; linkler derinlikle bulunur. Tek bir siteyi derinlemesine tarayacaksanız açabilirsiniz.
 
@@ -200,10 +202,11 @@ Tüm anahtarlar ve varsayılanları `config.example.toml` içinde açıklanmış
 | Anahtar | Varsayılan | Etki |
 |---|---|---|
 | `general.output_dir` / `db_path` | `dataset` / `crawl_db` | Shard'lar ve gömülü DB |
-| `frontier.max_depth` | `3` | Link derinliği |
+| `frontier.max_depth` | `4` | Link derinliği (seed = 0) |
 | `frontier.min_delay_ms` | `1000` | Domain başına minimum istek aralığı |
 | `frontier.max_concurrency_per_domain` | `2` | Domain başına eşzamanlı istek |
-| `frontier.respect_crawl_delay` | `true` | robots.txt `Crawl-delay` üst sınırı |
+| `frontier.respect_crawl_delay` | `true` | robots.txt `Crawl-delay`'ine uy |
+| `frontier.max_crawl_delay_ms` | `5000` | Bu süreden uzun `Crawl-delay` isteyen siteler atlanır (`robots_blocked`) |
 | `frontier.discover_sitemaps` | `true` | robots.txt sitemap keşfi (büyük site listelerinde kapatın) |
 | `frontier.allowed_domains` / `blocked_domains` | `[]` | eTLD+1 bazlı kapsam |
 | `frontier.allowed_domains_file` | `""` | Site listesi txt dosyası; kapsam + varsayılan seed'ler |
@@ -229,8 +232,9 @@ Tüm anahtarlar ve varsayılanları `config.example.toml` içinde açıklanmış
 | `output.saved_urls_file` | `crawled_urls.txt` | Kaydedilen içerik sayfası URL'leri; sonraki taramalarda atlanır (`""` kapatır) |
 | `output.shard_size_bytes` | `268435456` | Rotasyon boyutu |
 | `output.zstd_level` | `5` | 1-22 (yalnız `jsonl`) |
+| `output.flush_interval_secs` | `15` | Bekleyen shard tamponunun diske yazılma aralığı (yazarken ve boşta) |
 | `pipeline.channel_capacity` | `256` | Aşamalar arası backpressure |
-| `pipeline.fetch_workers` | `32` | Eşzamanlı HTTP görevi |
+| `pipeline.fetch_workers` | `64` | Eşzamanlı HTTP isteği (ağ darboğazını açar) |
 | `pipeline.extract_workers` / `filter_workers` | `0` (=CPU) | CPU havuzu |
 | `pipeline.dedup_workers` | `0` (=CPU/2) | Dedup havuzu |
 
@@ -287,7 +291,7 @@ Her ret tek bir `RejectReason` üretir ve atomik sayaçlara yazılır; manifestt
 
 | Amaç | Öneri |
 |---|---|
-| Tek makinede maksimum throughput | `pipeline.fetch_workers = 128`, `channel_capacity = 1024`, `extract_workers/filter_workers = CPU`, `dedup_workers = CPU/2` |
+| Tek makinede maksimum throughput | `pipeline.fetch_workers = 128`, `channel_capacity = 1024`, `max_concurrency_per_domain = 4`, `extract_workers/filter_workers = CPU`, `dedup_workers = CPU/2` |
 | Nazik tarama | `min_delay_ms = 2000`, `max_concurrency_per_domain = 1`, `respect_crawl_delay = true` |
 | Yüksek kalite, küçük hacim | `min_words = 300`, `min_lang_confidence = 0.95`, `max_hamming_distance = 2` |
 | Depolama tasarrufu | `zstd_level = 9`, `shard_size_bytes = 536870912` |
@@ -295,10 +299,36 @@ Her ret tek bir `RejectReason` üretir ve atomik sayaçlara yazılır; manifestt
 
 Pratik gözlemler:
 
-* Darboğaz genelde ağdır; `fetch_workers` CPU sayısından çok daha yüksek olabilir.
+* Darboğaz genelde ağdır; `fetch_workers` CPU sayısından çok daha yüksek olabilir. Frontier URL'leri 64'lük partiler halinde çekilir, böylece besleyici hızlı fetch aşamasını aç bırakmaz.
+* Besleyici, domain başına uçuştaki istek sayısını izler ve dolu bir domainin URL'lerini kuyruğun arkasına atar; böylece komşu URL'ler aynı domainden olsa bile boş fetch slotları başka domainlere hizmet eder. Ağ tarafındaki gerçek eşzamanlılık `fetch_workers` ile `max_concurrency_per_domain × aktif domain sayısı` değerinin küçüğüdür; `fetch_workers`'ı bu tavanın çok üstüne çıkarmak kazanç getirmez.
+
+Aşağıdaki sayılar bu depodaki ölçüm aparatıyla (aynı makine, release derleme, 12 yerel domain × 8 eşzamanlılık, her yanıt 60 ms gecikmeli, 972 sayfa; dedup kapalı) alınmıştır:
+
+| Ölçüm | Değişiklik öncesi | Sonrası |
+|---|---|---|
+| Frontier'a 5.000 URL ekleme | 5,0 s (~1.640 URL/s) | 0,25 s (~20.000 URL/s) |
+| Frontier'dan 5.000 URL çekme | 0,022 s | 0,016 s |
+| Fetch, 32 işçi | 239 sayfa/s | 486 sayfa/s |
+| Fetch, 64 işçi | 324 sayfa/s | 862 sayfa/s |
+| Fetch, 128 işçi | 440 sayfa/s | 1.190 sayfa/s |
+| Fetch, 256 işçi | 644 sayfa/s | 1.186 sayfa/s |
+
+`fetch_workers = 128` bu düzenekte tepe noktasıdır; 256 işçi domain başına eşzamanlılık tavanına takıldığı için ek kazanç vermez.
+
+### Gerçek ağ üzerinde ölçüm
+
+`config.tr.toml` (1084 site, `max_depth = 4`, `max_pages = 5000`) ile gerçek sitelere karşı koşulan tarama: **173 s**, 4.646 başarılı fetch, 272 fetch hatası, 82 robots engeli, 927 belge (535.541 kelime, 4,47 MiB). `max_crawl_delay_ms` sınırı olmadan aynı koşu 408 s sürüyordu: 30-300 s `Crawl-delay` isteyen ~80 site fetch slotlarını bloke ediyor ve bütçe bittikten sonra da koşu kapanmıyordu.
+
+Derinliğin etkisi tek bir gerçek sitede (60 sayfa bütçesi, aynı ayarlar):
+
+| `max_depth` | Fetch | Belge | Kelime |
+|---|---|---|---|
+| 0 | 1 | 1 | 817 |
+| 1 | 16 | 10 | 3.136 |
+| 4 | 60 | 49 | 95.424 |
 * `dedup_workers`'ı CPU/2 üzerine çıkarmak sled yazma rekabetini artırır, kazanç sağlamaz.
 * Zstd seviye 3-6 arası metinde iyi sıkıştırma/hız dengesi verir; >9 tek çekirdekte darboğaz olur.
-* RAM tüketimi `channel_capacity × (belge boyutu + payload)` ile sınırlıdır; belge boyutu `fetch.max_response_bytes` ile tavanlanır.
+* RAM tüketimi `channel_capacity × (belge boyutu + payload)` ile sınırlıdır; belge boyutu `fetch.max_response_bytes` ile tavanlanır. En kötü durumda uçuştaki gövdeler `fetch_workers × fetch.max_response_bytes` kadardır (64 × 5 MiB ≈ 320 MiB varsayılanda, `config.tr.toml` içinde 128 × 5 MiB ≈ 640 MiB); bu yüzden `fetch_workers` yükseltilirken bellek de hesaba katılmalıdır.
 
 ---
 

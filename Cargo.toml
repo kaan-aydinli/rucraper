@@ -2,9 +2,14 @@
 name = "pretrain-scraper"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Bounded-memory Rust web crawler and cleaning pipeline that produces LLM pretraining corpora"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/kaan-aydinli/rucraper"
+keywords = ["crawler", "pretraining", "corpus", "dataset", "scraper"]
+categories = ["command-line-utilities", "web-programming"]
+exclude = ["/dataset_tr*", "/crawl_*", "*.log"]
 
 [[bin]]
 name = "pretrain-scraper"
@@ -26,6 +31,9 @@ rand = "0.8"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
+    # HTTP/2 multiplexes same-origin requests over one TLS connection; without
+    # this feature the client falls back to HTTP/1.1 keep-alive only.
+    "http2",
     "gzip",
     "brotli",
     "zstd",
@@ -62,6 +70,15 @@ zstd = "0.13"
 serde_json = "1"
 tempfile = "3"
 toml = "0.8"
+
+[lints.rust]
+# The crate contains no `unsafe` block and must stay that way.
+unsafe_code = "forbid"
+# Every public item is documented; the lint keeps it that way.
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
 
 [profile.release]
 lto = "thin"

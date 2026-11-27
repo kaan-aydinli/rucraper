@@ -107,7 +107,6 @@ impl ParagraphDeduper {
         }
 
         let mut kept: Vec<&str> = Vec::new();
-        let mut saw_heading = false;
         for paragraph in text.split("\n\n") {
             let trimmed = paragraph.trim();
             if trimmed.is_empty() {
@@ -115,7 +114,6 @@ impl ParagraphDeduper {
             }
             // Never strip headings: they carry the document structure.
             if trimmed.starts_with('#') {
-                saw_heading = true;
                 kept.push(trimmed);
                 continue;
             }
@@ -135,9 +133,6 @@ impl ParagraphDeduper {
             kept.push(trimmed);
         }
 
-        if !saw_heading {
-            return kept.join("\n\n");
-        }
         kept.join("\n\n")
     }
 

@@ -143,7 +143,13 @@ pub struct Fetcher {
 
 impl Fetcher {
     /// Build the HTTP client from configuration.
-    pub fn new(config: &FetchConfig) -> Result<Self> {
+    ///
+    /// `max_concurrency_per_domain` sizes the keep-alive pool: a domain that is
+    /// allowed N parallel requests needs N idle connections, otherwise every
+    /// request pays for a fresh TCP + TLS handshake. `tcp_nodelay` removes the
+    /// Nagle delay, which dominates the request latency of small HTML pages.
+    pub fn new(config: &FetchConfig, max_concurrency_per_domain: usize) -> Result<Self> {
+        let pool_per_host = max_concurrency_per_domain.clamp(1, 64) * 2;
         let client = Client::builder()
             .user_agent(config.user_agent.clone())
             .timeout(Duration::from_secs(config.request_timeout_secs.max(1)))
@@ -156,7 +162,8 @@ impl Fetcher {
             .zstd(true)
             .deflate(true)
             .cookie_provider(std::sync::Arc::new(reqwest::cookie::Jar::default()))
-            .pool_max_idle_per_host(8)
+            .pool_max_idle_per_host(pool_per_host)
+            .tcp_nodelay(true)
             .build()?;
         Ok(Self {
             client,
